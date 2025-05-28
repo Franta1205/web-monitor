@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,11 +169,12 @@ func TestThreadSafety(t *testing.T) {
 	const numGoroutines = 10
 	const updatesPerGoroutine = 100
 
-	done := make(chan bool, numGoroutines)
+	var wg sync.WaitGroup
 
-	// updating stats concurrently
 	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
 		go func(routineID int) {
+			defer wg.Done()
 			for j := 0; j < updatesPerGoroutine; j++ {
 				duration := time.Millisecond * time.Duration(j+routineID)
 				size := int64(j + routineID*100)
@@ -178,13 +182,10 @@ func TestThreadSafety(t *testing.T) {
 
 				urlStats.Update(duration, size, success)
 			}
-			done <- true
 		}(i)
 	}
 
-	for i := 0; i < numGoroutines; i++ {
-		<-done
-	}
+	wg.Wait()
 
 	snapshot := urlStats.GetSnapshot()
 
@@ -233,16 +234,20 @@ func TestHTTPSuccessDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			httpmock.Activate()
-			defer httpmock.DeactivateAndReset()
+			t.Parallel()
 
-			url := fmt.Sprintf("http://test.example.com/status%d", tt.statusCode)
+			mockTransport := httpmock.NewMockTransport()
+			
+			url := fmt.Sprintf("http://test%d.example.com/status", tt.statusCode)
 
-			httpmock.RegisterResponder("GET", url,
+			mockTransport.RegisterResponder("GET", url,
 				httpmock.NewStringResponder(tt.statusCode, "Test response body"))
 
 			monitor := NewMonitor([]string{url})
-			monitor.makeRequest(url)
+			monitor.httpClient.Transport = mockTransport
+
+			ctx := context.Background()
+			monitor.makeRequest(ctx, url)
 
 			stats := monitor.stats[url].GetSnapshot()
 
@@ -259,6 +264,10 @@ func TestHTTPSuccessDetection(t *testing.T) {
 				t.Errorf("Status %d: Expected success count %d, got %d",
 					tt.statusCode, expectedSuccessCount, stats.SuccessCount)
 			}
+
+			if callCount := mockTransport.GetCallCountInfo()[fmt.Sprintf("GET %s", url)]; callCount != 1 {
+				t.Errorf("Expected 1 call to mock, got %d", callCount)
+			}
 		})
 	}
 }
@@ -266,7 +275,14 @@ func TestHTTPSuccessDetection(t *testing.T) {
 func TestMakeRequestBasic(t *testing.T) {
 	t.Parallel()
 
-	monitor := NewMonitor([]string{"http://test.example.com"})
+	mockTransport := httpmock.NewMockTransport()
+	url := "http://test-basic.example.com"
+	
+	mockTransport.RegisterResponder("GET", url,
+		httpmock.NewStringResponder(200, "OK"))
+
+	monitor := NewMonitor([]string{url})
+	monitor.httpClient.Transport = mockTransport
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -274,9 +290,10 @@ func TestMakeRequestBasic(t *testing.T) {
 		}
 	}()
 
-	monitor.makeRequest("http://test.example.com")
+	ctx := context.Background()
+	monitor.makeRequest(ctx, url)
 
-	stats := monitor.stats["http://test.example.com"].GetSnapshot()
+	stats := monitor.stats[url].GetSnapshot()
 	if stats.TotalRequests != 1 {
 		t.Errorf("Expected 1 request recorded, got %d", stats.TotalRequests)
 	}
@@ -361,10 +378,13 @@ func TestFormatFunctions(t *testing.T) {
 	}
 
 	for _, test := range testDurations {
-		result := formatDuration(test.input)
-		if result != test.expected {
-			t.Errorf("formatDuration(%v) = %s, expected %s", test.input, result, test.expected)
-		}
+		t.Run(fmt.Sprintf("duration_%v", test.input), func(t *testing.T) {
+			t.Parallel()
+			result := formatDuration(test.input)
+			if result != test.expected {
+				t.Errorf("formatDuration(%v) = %s, expected %s", test.input, result, test.expected)
+			}
+		})
 	}
 
 	testSizes := []struct {
@@ -378,10 +398,13 @@ func TestFormatFunctions(t *testing.T) {
 	}
 
 	for _, test := range testSizes {
-		result := formatSize(test.input)
-		if result != test.expected {
-			t.Errorf("formatSize(%d) = %s, expected %s", test.input, result, test.expected)
-		}
+		t.Run(fmt.Sprintf("size_%d", test.input), func(t *testing.T) {
+			t.Parallel()
+			result := formatSize(test.input)
+			if result != test.expected {
+				t.Errorf("formatSize(%d) = %s, expected %s", test.input, result, test.expected)
+			}
+		})
 	}
 }
 
@@ -465,5 +488,99 @@ func TestURLStatsUpdate(t *testing.T) {
 
 	if snapshot.SuccessCount != 2 {
 		t.Errorf("Expected 2 successful requests, got %d", snapshot.SuccessCount)
+	}
+}
+
+func TestMonitorWithCustomTransport(t *testing.T) {
+	t.Parallel()
+
+	mockTransport := httpmock.NewMockTransport()
+	url := "http://custom-transport.example.com"
+	
+	mockTransport.RegisterResponder("GET", url,
+		httpmock.NewStringResponder(200, "Custom transport response"))
+
+	monitor := NewMonitor([]string{url})
+	
+	originalTransport := monitor.httpClient.Transport
+	monitor.httpClient.Transport = mockTransport
+	
+	defer func() {
+		monitor.httpClient.Transport = originalTransport
+	}()
+
+	ctx := context.Background()
+	monitor.makeRequest(ctx, url)
+
+	stats := monitor.stats[url].GetSnapshot()
+	if stats.TotalRequests != 1 {
+		t.Errorf("Expected 1 request with custom transport, got %d", stats.TotalRequests)
+	}
+
+	if stats.SuccessCount != 1 {
+		t.Errorf("Expected 1 successful request with custom transport, got %d", stats.SuccessCount)
+	}
+}
+
+func TestMakeRequestWithCancellation(t *testing.T) {
+	t.Parallel()
+
+	mockTransport := httpmock.NewMockTransport()
+	url := "http://test-cancellation.example.com"
+	
+	mockTransport.RegisterResponder("GET", url,
+		func(req *http.Request) (*http.Response, error) {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(100 * time.Millisecond):
+				return httpmock.NewStringResponse(200, "OK"), nil
+			}
+		})
+
+	monitor := NewMonitor([]string{url})
+	monitor.httpClient.Transport = mockTransport
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	monitor.makeRequest(ctx, url)
+
+	stats := monitor.stats[url].GetSnapshot()
+	if stats.TotalRequests != 1 {
+		t.Errorf("Expected 1 request recorded even with cancellation, got %d", stats.TotalRequests)
+	}
+
+	if stats.SuccessCount != 0 {
+		t.Errorf("Expected 0 successful requests due to cancellation, got %d", stats.SuccessCount)
+	}
+}
+
+func TestMonitorStartWithContext(t *testing.T) {
+	t.Parallel()
+
+	mockTransport := httpmock.NewMockTransport()
+	url := "http://test-monitor-start.example.com"
+	
+	mockTransport.RegisterResponder("GET", url,
+		httpmock.NewStringResponder(200, "OK"))
+
+	monitor := NewMonitor([]string{url})
+	monitor.httpClient.Transport = mockTransport
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	monitor.Start(ctx, &wg)
+
+	<-ctx.Done()
+	
+	wg.Wait()
+
+	stats := monitor.stats[url].GetSnapshot()
+	
+	if stats.TotalRequests == 0 {
+		t.Errorf("Expected at least 1 request, got %d", stats.TotalRequests)
 	}
 }
