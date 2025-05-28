@@ -2,9 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"runtime"
 	"time"
 )
 
@@ -61,16 +58,7 @@ func (m *Monitor) renderTable() {
 }
 
 func (m *Monitor) clearScreen() {
-	var cmd *exec.Cmd
-
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", "cls")
-	} else {
-		cmd = exec.Command("clear")
-	}
-
-	cmd.Stdout = os.Stdout
-	cmd.Run()
+	fmt.Print("\033[2J\033[H")
 }
 
 func formatDuration(d time.Duration) string {
