@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"sync"
@@ -11,8 +12,6 @@ type Monitor struct {
 	urls        []string
 	stats       map[string]*URLStats
 	httpClient  *http.Client
-	shutdown    chan struct{}
-	wg          sync.WaitGroup
 	statsMu     sync.RWMutex
 	updatedData chan struct{}
 }
@@ -30,44 +29,48 @@ func NewMonitor(urls []string) *Monitor {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		shutdown:    make(chan struct{}),
-		updatedData: make(chan struct{}),
+		updatedData: make(chan struct{}, 100),
 	}
 }
 
-func (m *Monitor) Start() {
-
+func (m *Monitor) Start(ctx context.Context, wg *sync.WaitGroup) {
 	for _, url := range m.urls {
-		m.wg.Add(1)
-		go m.monitorURL(url)
+		wg.Add(1)
+		go m.monitorURL(ctx, wg, url)
 	}
 
-	m.wg.Add(1)
-	go m.displayLoop()
+	wg.Add(1)
+	go m.displayLoop(ctx, wg)
 }
 
-func (m *Monitor) monitorURL(url string) {
-	defer m.wg.Done()
+func (m *Monitor) monitorURL(ctx context.Context, wg *sync.WaitGroup, url string) {
+	defer wg.Done()
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	m.makeRequest(url)
+	m.makeRequest(ctx, url)
 
 	for {
 		select {
 		case <-ticker.C:
-			m.makeRequest(url)
-		case <-m.shutdown:
+			m.makeRequest(ctx, url)
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (m *Monitor) makeRequest(url string) {
+func (m *Monitor) makeRequest(ctx context.Context, url string) {
 	start := time.Now()
 
-	resp, err := m.httpClient.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		m.updateStats(url, time.Since(start), 0, false)
+		return
+	}
+
+	resp, err := m.httpClient.Do(req)
 	duration := time.Since(start)
 
 	var bodySize int64
@@ -105,8 +108,8 @@ func (m *Monitor) updateStats(url string, duration time.Duration, bodySize int64
 	}
 }
 
-func (m *Monitor) displayLoop() {
-	defer m.wg.Done()
+func (m *Monitor) displayLoop(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	m.displayTable()
 
@@ -114,16 +117,12 @@ func (m *Monitor) displayLoop() {
 		select {
 		case <-m.updatedData:
 			m.displayTable()
-		case <-m.shutdown:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (m *Monitor) Shutdown() {
-	close(m.shutdown)
-
-	m.wg.Wait()
-
+func (m *Monitor) DisplayFinalTable() {
 	m.displayFinalTable()
 }

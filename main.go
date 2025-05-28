@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 )
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	urls, err := validateURLs(os.Args[1:])
 	if err != nil {
@@ -20,15 +24,16 @@ func main() {
 
 	monitor := NewMonitor(urls)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	var wg sync.WaitGroup
 
-	go monitor.Start()
+	monitor.Start(ctx, &wg)
 
-	<-sigChan
+	<-ctx.Done()
 	fmt.Println("\nShutting down gracefully...")
 
-	monitor.Shutdown()
+	wg.Wait()
+
+	monitor.DisplayFinalTable()
 }
 
 func validateURLs(args []string) ([]string, error) {
