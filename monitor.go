@@ -8,12 +8,13 @@ import (
 )
 
 type Monitor struct {
-	urls       []string
-	stats      map[string]*URLStats
-	httpClient *http.Client
-	shutdown   chan struct{}
-	wg         sync.WaitGroup
-	statsMu    sync.RWMutex
+	urls        []string
+	stats       map[string]*URLStats
+	httpClient  *http.Client
+	shutdown    chan struct{}
+	wg          sync.WaitGroup
+	statsMu     sync.RWMutex
+	updatedData chan struct{}
 }
 
 func NewMonitor(urls []string) *Monitor {
@@ -29,7 +30,8 @@ func NewMonitor(urls []string) *Monitor {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		shutdown: make(chan struct{}),
+		shutdown:    make(chan struct{}),
+		updatedData: make(chan struct{}),
 	}
 }
 
@@ -96,19 +98,21 @@ func (m *Monitor) updateStats(url string, duration time.Duration, bodySize int64
 	m.statsMu.RUnlock()
 
 	stat.Update(duration, bodySize, success)
+
+	select {
+	case m.updatedData <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Monitor) displayLoop() {
 	defer m.wg.Done()
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
 	m.displayTable()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-m.updatedData:
 			m.displayTable()
 		case <-m.shutdown:
 			return
